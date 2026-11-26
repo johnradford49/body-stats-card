@@ -1,13 +1,16 @@
 /* body-stats-card \u2014 InBody-style body composition card for Home Assistant
  * type: custom:body-stats-card
  */
-const BSC_VERSION = "1.0.0";
-const COLORS = { weight: "var(--primary-color, #03a9f4)", muscle: "#22c55e", fat: "#f97316", water: "#3b82f6" };
+const BSC_VERSION = "1.1.0";
+const COLORS = { weight: "var(--primary-color, #03a9f4)", muscle: "#22c55e", fat: "#f97316", water: "#3b82f6",
+  steps: "#14b8a6", heart: "#ef4444", calories: "#f59e0b", sleep: "#8b5cf6" };
 const LABELS = { weight: "Weight", muscle: "Muscle", fat: "Body fat", water: "Body water" };
 // whether an increase is good (+1), bad (-1) or neutral (0)
 const GOOD_DIR = { weight: 0, muscle: 1, fat: -1, water: 0 };
-const ALL_TABS = ["weight", "percentage", "composition", "quadrant"];
-const TAB_LABELS = { weight: "Weight", percentage: "Percentage", composition: "Composition", quadrant: "Body type" };
+const BODY_TABS = ["weight", "percentage", "composition", "quadrant"];
+const ALL_TABS = [...BODY_TABS, "activity"];
+const ACT_KEYS = ["steps", "heart", "calories", "active_calories", "sleep"];
+const TAB_LABELS = { weight: "Weight", percentage: "Percentage", composition: "Composition", quadrant: "Body type", activity: "Activity" };
 
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const num = (v) => { const n = parseFloat(v); return Number.isFinite(n) ? n : null; };
@@ -23,7 +26,7 @@ class BodyStatsCard extends HTMLElement {
     return {
       schema: [
         { name: "title", selector: { text: {} } },
-        { name: "weight_entity", required: true, selector: { entity: { domain: "sensor" } } },
+        { name: "weight_entity", selector: { entity: { domain: "sensor" } } },
         { name: "fat_entity", selector: { entity: { domain: "sensor" } } },
         { name: "muscle_entity", selector: { entity: { domain: "sensor" } } },
         { name: "water_entity", selector: { entity: { domain: "sensor" } } },
@@ -37,11 +40,25 @@ class BodyStatsCard extends HTMLElement {
         },
         { name: "tabs", selector: { select: { multiple: true, options: ALL_TABS.map((t) => ({ value: t, label: TAB_LABELS[t] })) } } },
         { name: "show_graph", selector: { boolean: {} } },
+        {
+          type: "expandable", name: "", title: "Activity", icon: "mdi:walk", schema: [
+            { name: "steps_entity", selector: { entity: { domain: "sensor" } } },
+            { name: "steps_goal", selector: { number: { min: 1000, max: 50000, step: 500, mode: "box", unit_of_measurement: "steps" } } },
+            { name: "heart_rate_entity", selector: { entity: { domain: "sensor" } } },
+            { name: "calories_entity", selector: { entity: { domain: "sensor" } } },
+            { name: "active_calories_entity", selector: { entity: { domain: "sensor" } } },
+            { name: "sleep_entity", selector: { entity: { domain: "sensor" } } },
+            { name: "activity_days", selector: { number: { min: 3, max: 31, step: 1, mode: "box", unit_of_measurement: "days" } } },
+          ],
+        },
       ],
       computeLabel: (s) => ({
         title: "Title", weight_entity: "Weight sensor", fat_entity: "Body fat sensor", muscle_entity: "Muscle sensor",
         water_entity: "Body water sensor", height_cm: "Height (for BMI)", body_type: "Body figure", days_to_show: "Days of history",
         default_tab: "Default tab", tabs: "Tabs to show", show_graph: "Show graph",
+        steps_entity: "Daily steps sensor", steps_goal: "Daily step goal", heart_rate_entity: "Heart rate sensor",
+        calories_entity: "Total calories sensor", active_calories_entity: "Active calories sensor",
+        sleep_entity: "Sleep duration sensor", activity_days: "Days shown in activity charts",
       }[s.name]),
     };
   }
@@ -55,17 +72,23 @@ class BodyStatsCard extends HTMLElement {
       fat_entity: find(/fat/) || "",
       muscle_entity: find(/muscle/) || "",
       water_entity: find(/water/, (s) => s.attributes.unit_of_measurement === "%") || "",
+      steps_entity: find(/daily_steps|steps/, (s) => !["unknown", "unavailable"].includes(s.state)) || undefined,
+      heart_rate_entity: find(/heart_rate/) || undefined,
       body_type: "male",
       days_to_show: 90,
     };
   }
 
   setConfig(config) {
-    if (!config.weight_entity) throw new Error("weight_entity is required");
-    const tabs = (config.tabs && config.tabs.length ? config.tabs : ALL_TABS).filter((t) => ALL_TABS.includes(t));
-    this._config = { days_to_show: 90, body_type: "male", show_graph: true, ...config, tabs };
+    const hasAct = ["steps_entity", "heart_rate_entity", "calories_entity", "active_calories_entity", "sleep_entity"].some((k) => config[k]);
+    if (!config.weight_entity && !hasAct) throw new Error("Set weight_entity and/or an activity sensor (steps_entity, heart_rate_entity, ...)");
+    const avail = ALL_TABS.filter((t) => (t === "activity" ? hasAct : !!config.weight_entity));
+    const tabs = (config.tabs && config.tabs.length ? config.tabs : avail).filter((t) => avail.includes(t));
+    this._config = { days_to_show: 90, body_type: "male", show_graph: true, steps_goal: 10000, activity_days: 7, ...config, tabs };
     this._tab = tabs.includes(config.default_tab) ? config.default_tab : tabs[0];
-    this._series = { weight: "weight", percentage: "fat" };
+    this._series = { weight: "weight", percentage: "fat", activity: config.steps_entity ? "steps" : "heart" };
+    this._act = null;
+    this._actKey = null;
     this._idx = null; // selected weigh-in for composition / quadrant (null = latest)
     this._data = null;
     this._loadedKey = null;
@@ -97,8 +120,15 @@ class BodyStatsCard extends HTMLElement {
     return { weight: c.weight_entity, fat: c.fat_entity, muscle: c.muscle_entity, water: c.water_entity };
   }
 
+  get _actMetrics() {
+    const c = this._config;
+    return { steps: c.steps_entity, heart: c.heart_rate_entity, calories: c.calories_entity, active_calories: c.active_calories_entity, sleep: c.sleep_entity };
+  }
+
   _maybeLoad(force) {
     if (!this._hass || !this._config) return;
+    if (this._config.tabs.includes("activity")) this._maybeLoadActivity(force);
+    if (!this._config.weight_entity) { if (!this._data) { this._data = []; } return; }
     const ents = Object.values(this._metrics).filter(Boolean);
     const key = ents.map((e) => `${e}:${this._hass.states[e]?.last_changed || ""}`).join("|") + `|${this._config.days_to_show}`;
     if (!force && key === this._loadedKey) return;
@@ -128,6 +158,74 @@ class BodyStatsCard extends HTMLElement {
       });
     } catch (e) { /* entities without state_class have no statistics */ }
     this._data = this._buildWeighIns(hist || {}, stats || {});
+    this._render();
+  }
+
+  _maybeLoadActivity(force) {
+    const ents = Object.values(this._actMetrics).filter(Boolean);
+    const key = ents.map((e) => `${e}:${this._hass.states[e]?.last_changed || ""}`).join("|");
+    if (!force && key === this._actKey) return;
+    // live tiles update on every state change; the history behind the charts is refetched at most once a minute
+    const firstLoad = !this._act;
+    this._actKey = key;
+    if (!firstLoad) this._render();
+    if (this._actTimer) return;
+    this._actTimer = setTimeout(() => { this._actTimer = null; this._loadActivity(); }, firstLoad ? 0 : 60000);
+  }
+
+  async _loadActivity() {
+    const hass = this._hass;
+    const am = this._actMetrics;
+    const ents = Object.values(am).filter(Boolean);
+    const days = Math.max(3, Math.min(31, Number(this._config.activity_days) || 7));
+    const end = new Date();
+    const dayStart = new Date(end); dayStart.setHours(0, 0, 0, 0);
+    const start = new Date(dayStart.getTime() - (days - 1) * 864e5);
+    let hist = {}, stats = {};
+    try {
+      hist = await hass.callWS({
+        type: "history/history_during_period", start_time: start.toISOString(), end_time: end.toISOString(),
+        entity_ids: ents, minimal_response: true, no_attributes: true, significant_changes_only: false,
+      });
+    } catch (e) { console.warn("body-stats-card: activity history failed", e); }
+    const sumIds = [am.steps, am.calories, am.active_calories].filter(Boolean);
+    if (sumIds.length) {
+      try {
+        stats = await hass.callWS({
+          type: "recorder/statistics_during_period", start_time: start.toISOString(), end_time: end.toISOString(),
+          statistic_ids: sumIds, period: "day", types: ["change"],
+        });
+      } catch (e) { /* no long-term statistics */ }
+    }
+    const series = {};
+    for (const [k, id] of Object.entries(am)) {
+      if (!id) continue;
+      series[k] = (hist[id] || [])
+        .map((r) => ({ t: r.lu ?? r.lc ?? r.last_updated, v: num(r.s ?? r.state) }))
+        .map((r) => ({ t: typeof r.t === "number" ? r.t * 1000 : Date.parse(r.t), v: r.v }))
+        .filter((r) => r.v != null && Number.isFinite(r.t))
+        .sort((a, b) => a.t - b.t);
+    }
+    const dayList = Array.from({ length: days }, (_, i) => { const d = new Date(dayStart); d.setDate(d.getDate() - (days - 1 - i)); return d.getTime(); });
+    const sameDay = (a, b) => { const x = new Date(a); x.setHours(0, 0, 0, 0); return x.getTime() === b; };
+    const daily = (k, useStats) => dayList.map((d) => {
+      let v = null;
+      if (useStats) {
+        const row = (stats[am[k]] || []).find((r) => sameDay(this._ts(r.start), d));
+        if (row && num(row.change) != null) v = num(row.change);
+      }
+      const inDay = (series[k] || []).filter((r) => sameDay(r.t, d));
+      if (inDay.length) { const mx = Math.max(...inDay.map((r) => r.v)); v = v == null ? mx : Math.max(v, mx); }
+      return { t: d, v };
+    });
+    this._act = {
+      days: dayList,
+      steps: am.steps ? daily("steps", true) : null,
+      calories: am.calories ? daily("calories", true) : null,
+      active_calories: am.active_calories ? daily("active_calories", true) : null,
+      sleep: am.sleep ? daily("sleep", false) : null,
+      heart: series.heart || [],
+    };
     this._render();
   }
 
@@ -215,7 +313,8 @@ class BodyStatsCard extends HTMLElement {
     const d = this._data || [];
     const latest = d[d.length - 1];
     let body;
-    if (!this._data) body = `<div class="empty">Loading\u2026</div>`;
+    if (this._tab === "activity") body = this._act ? this._tab_activity() : `<div class="empty">Loading\u2026</div>`;
+    else if (!this._data) body = `<div class="empty">Loading\u2026</div>`;
     else if (!latest) body = `<div class="empty">No weigh-ins found in the last ${c.days_to_show} days.</div>`;
     else body = this[`_tab_${this._tab}`]();
 
@@ -224,7 +323,7 @@ class BodyStatsCard extends HTMLElement {
       : "";
     this.shadowRoot.innerHTML = `<style>${this._css()}</style>
       <ha-card>
-        ${c.title ? `<div class="head"><div class="title">${esc(c.title)}</div>${this._staleness(latest)}</div>` : `<div class="head">${this._staleness(latest)}</div>`}
+        ${c.title || latest ? `<div class="head"><div class="title">${esc(c.title || "")}</div>${this._staleness(latest)}</div>` : ""}
         ${tabs}
         <div class="body">${body}</div>
       </ha-card>`;
@@ -269,27 +368,33 @@ class BodyStatsCard extends HTMLElement {
     const key = this._series[mode];
     const pts = this._data.map((w) => ({ t: w.t, v: mode === "weight" ? w.kg[key] : w.pct[key], daily: w.daily })).filter((p) => p.v != null);
     if (pts.length < 2) return `<div class="empty small">Not enough weigh-ins yet to draw a trend.</div>`;
+    return this._lineChart(pts, COLORS[key], mode === "weight" ? "kg" : "%", { label: LABELS[key] });
+  }
+
+  _lineChart(pts, color, unit, opts = {}) {
+    const dec = opts.decimals ?? 1;
+    const fmtv = (v) => (opts.format ? opts.format(v) : fmt(v, dec));
     const W = Math.max(260, Math.round(this._width || 400)), H = 190, L = 38, R = 8, T = 34, B = 22;
     this._gw = W;
     const t0 = pts[0].t, t1 = pts[pts.length - 1].t;
     let vmin = Math.min(...pts.map((p) => p.v)), vmax = Math.max(...pts.map((p) => p.v));
-    const pad = Math.max((vmax - vmin) * 0.15, 0.5);
+    const pad = Math.max((vmax - vmin) * 0.15, opts.minPad ?? 0.5);
     vmin -= pad; vmax += pad;
     const x = (t) => L + ((t - t0) / Math.max(t1 - t0, 1)) * (W - L - R);
     const y = (v) => T + (1 - (v - vmin) / (vmax - vmin)) * (H - T - B);
     const line = pts.map((p, i) => `${i ? "L" : "M"}${x(p.t).toFixed(1)},${y(p.v).toFixed(1)}`).join("");
     const area = `${line}L${x(t1).toFixed(1)},${H - B}L${x(t0).toFixed(1)},${H - B}Z`;
     const ticks = [0, 0.5, 1].map((f) => vmin + f * (vmax - vmin));
-    const dfmt = (t) => new Date(t).toLocaleDateString(this._lang, { day: "numeric", month: "short" });
-    const unit = mode === "weight" ? "kg" : "%";
-    this._graphPts = pts.map((p) => ({ ...p, x: x(p.t), y: y(p.v), unit, label: LABELS[key] }));
-    return `<div class="graph" style="--c:${COLORS[key]}">
+    const short = t1 - t0 < 1.5 * 864e5;
+    const dfmt = (t) => (short ? new Date(t).toLocaleTimeString(this._lang, { hour: "2-digit", minute: "2-digit" }) : new Date(t).toLocaleDateString(this._lang, { day: "numeric", month: "short" }));
+    this._graphPts = pts.map((p) => ({ ...p, x: x(p.t), y: y(p.v), unit, text: fmtv(p.v) }));
+    return `<div class="graph" style="--c:${color}">
       <svg viewBox="0 0 ${W} ${H}">
-        <defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${COLORS[key]}" stop-opacity=".35"/><stop offset="1" stop-color="${COLORS[key]}" stop-opacity="0"/></linearGradient></defs>
-        ${ticks.map((v) => `<line class="grid" x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}"/><text class="ax" x="${L - 6}" y="${y(v) + 4}" text-anchor="end">${fmt(v)}</text>`).join("")}
+        <defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${color}" stop-opacity=".35"/><stop offset="1" stop-color="${color}" stop-opacity="0"/></linearGradient></defs>
+        ${ticks.map((v) => `<line class="grid" x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}"/><text class="ax" x="${L - 6}" y="${y(v) + 4}" text-anchor="end">${fmtv(v)}</text>`).join("")}
         <path d="${area}" fill="url(#g)"/>
         <path d="${line}" class="ln"/>
-        ${pts.length <= 60 ? this._graphPts.map((p) => `<circle cx="${p.x}" cy="${p.y}" r="3" class="pt ${p.daily ? "daily" : ""}"/>`).join("") : ""}
+        ${pts.length <= (opts.maxDots ?? 60) ? this._graphPts.map((p) => `<circle cx="${p.x}" cy="${p.y}" r="3" class="pt ${p.daily ? "daily" : ""}"/>`).join("") : ""}
         <text class="ax" x="${L}" y="${H - 6}">${dfmt(t0)}</text>
         <text class="ax" x="${W - R}" y="${H - 6}" text-anchor="end">${dfmt(t1)}</text>
         <g class="hover" style="display:none"><line class="hl" y1="${T}" y2="${H - B}"/><circle r="5" class="hp"/></g>
@@ -297,6 +402,122 @@ class BodyStatsCard extends HTMLElement {
       </svg>
       <div class="tip" style="display:none"></div>
     </div>`;
+  }
+
+  _barChart(pts, color, unit, opts = {}) {
+    const W = Math.max(260, Math.round(this._width || 400)), H = 190, L = 44, R = 8, T = 34, B = 22;
+    this._gw = W;
+    const fmtv = opts.format || ((v) => Math.round(v).toLocaleString(this._lang));
+    const n = pts.length;
+    const vals = pts.map((p) => p.v ?? 0);
+    const vmax = Math.max(...vals, opts.goal || 0, 1) * 1.08;
+    const slot = (W - L - R) / n;
+    const bw = Math.min(36, slot * 0.62);
+    const y = (v) => T + (1 - v / vmax) * (H - T - B);
+    const today = new Date(); today.setHours(0, 0, 0, 0);
+    this._graphPts = pts.map((p, i) => ({ ...p, x: L + slot * (i + 0.5), y: y(p.v ?? 0), unit, text: p.v == null ? "\u2013" : fmtv(p.v), dateOnly: true }));
+    const label = (t) => (n <= 10 ? new Date(t).toLocaleDateString(this._lang, { weekday: "short" }) : new Date(t).toLocaleDateString(this._lang, { day: "numeric" }));
+    const ticks = [0, 0.5, 1].map((f) => f * vmax / 1.08);
+    return `<div class="graph" style="--c:${color}">
+      <svg viewBox="0 0 ${W} ${H}">
+        ${ticks.map((v) => `<line class="grid" x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}"/><text class="ax" x="${L - 6}" y="${y(v) + 4}" text-anchor="end">${fmtv(v)}</text>`).join("")}
+        ${this._graphPts.map((p) => {
+          const hgt = Math.max(p.v ? 2 : 0, H - B - p.y);
+          const hit = opts.goal && p.v >= opts.goal;
+          return `<rect x="${p.x - bw / 2}" y="${H - B - hgt}" width="${bw}" height="${hgt}" rx="${Math.min(6, bw / 3)}" class="bar ${hit ? "hit" : ""} ${p.t === today.getTime() ? "today" : ""}"/>`;
+        }).join("")}
+        ${opts.goal ? `<line class="goal" x1="${L}" x2="${W - R}" y1="${y(opts.goal)}" y2="${y(opts.goal)}"/><text class="ax goal-l" x="${W - R}" y="${y(opts.goal) - 4}" text-anchor="end">Goal ${fmtv(opts.goal)}</text>` : ""}
+        ${this._graphPts.map((p) => (n <= 10 || p === this._graphPts[0] || p === this._graphPts[n - 1] || n <= 16) ? `<text class="ax" x="${p.x}" y="${H - 6}" text-anchor="middle">${label(p.t)}</text>` : "").join("")}
+        <g class="hover" style="display:none"><line class="hl" y1="${T}" y2="${H - B}"/><circle r="4" class="hp"/></g>
+        <rect class="overlay" x="${L}" y="0" width="${W - L - R}" height="${H}" fill="transparent"/>
+      </svg>
+      <div class="tip" style="display:none"></div>
+    </div>`;
+  }
+
+  _sleepHours(v) {
+    if (v == null) return null;
+    const u = this._hass?.states[this._config.sleep_entity]?.attributes?.unit_of_measurement || "min";
+    return u === "h" ? v : u === "s" ? v / 3600 : u === "d" ? v * 24 : v / 60;
+  }
+
+  _hm(h) {
+    if (h == null) return "\u2013";
+    const m = Math.round(h * 60);
+    return `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, "0")}m`;
+  }
+
+  _tab_activity() {
+    const am = this._actMetrics, a = this._act, c = this._config;
+    const st = (id) => (id ? num(this._hass.states[id]?.state) : null);
+    const sel = this._series.activity;
+    const goal = Number(c.steps_goal) || 10000;
+    const loc = (v) => (v == null ? "\u2013" : Math.round(v).toLocaleString(this._lang));
+    const timeOf = (id) => {
+      const s = this._hass.states[id];
+      const t = Date.parse(s?.attributes?.date || s?.attributes?.endTime || s?.last_changed);
+      return Number.isFinite(t) ? new Date(t).toLocaleTimeString(this._lang, { hour: "2-digit", minute: "2-digit" }) : "";
+    };
+    let ring = "";
+    if (am.steps) {
+      const steps = st(am.steps);
+      const frac = steps == null ? 0 : Math.min(1, steps / goal);
+      const r = 44, C = 2 * Math.PI * r;
+      const week = (a.steps || []).filter((d) => d.v != null);
+      const avg = week.length ? week.reduce((s, d) => s + d.v, 0) / week.length : null;
+      ring = `<button class="ring ${sel === "steps" ? "sel" : ""}" data-series="steps" style="--c:${COLORS.steps}">
+        <div class="rwrap"><svg viewBox="0 0 110 110">
+          <circle cx="55" cy="55" r="${r}" class="rbg"/>
+          <circle cx="55" cy="55" r="${r}" class="rfg" stroke-dasharray="${(C * frac).toFixed(1)} ${C.toFixed(1)}" transform="rotate(-90 55 55)"/>
+        </svg>
+        <div class="rc"><span class="rv">${loc(steps)}</span><span class="rl">of ${loc(goal)} steps</span>
+          ${frac >= 1 ? `<span class="rok">\u2713 Goal reached</span>` : `<span class="rl">${Math.round(frac * 100)}%</span>`}</div></div>
+        ${avg != null ? `<span class="ravg">${a.days.length}-day avg ${loc(avg)}</span>` : ""}
+      </button>`;
+    }
+    const tiles = [];
+    if (am.heart) {
+      const hr = st(am.heart);
+      const day = (a.heart || []).filter((p) => p.t > Date.now() - 864e5).map((p) => p.v);
+      const range = day.length ? `${Math.min(...day)}\u2013${Math.max(...day)} today` : "";
+      tiles.push(this._actTile("heart", "Heart rate", hr == null ? "\u2013" : Math.round(hr), "bpm", `${timeOf(am.heart) ? `at ${timeOf(am.heart)}` : ""}${range ? ` \u00b7 ${range}` : ""}`));
+    }
+    if (am.calories || am.active_calories) {
+      const tot = st(am.calories), act = st(am.active_calories);
+      tiles.push(this._actTile("calories", "Calories", loc(tot ?? act), "kcal", am.calories && am.active_calories ? `${loc(act)} active` : am.calories ? "total today" : "active today"));
+    }
+    if (am.sleep) {
+      const h = this._sleepHours(st(am.sleep));
+      const lastNight = h ?? this._sleepHours([...(a.sleep || [])].reverse().find((d) => d.v != null)?.v ?? null);
+      tiles.push(this._actTile("sleep", "Sleep", this._hm(lastNight), "", h == null && lastNight != null ? "most recent" : "last night"));
+    }
+
+    let chart = "";
+    if (c.show_graph !== false) {
+      if (sel === "steps" && a.steps) chart = this._barChart(a.steps, COLORS.steps, "steps", { goal });
+      else if (sel === "calories" && (a.calories || a.active_calories)) chart = this._barChart(a.calories || a.active_calories, COLORS.calories, "kcal");
+      else if (sel === "sleep" && a.sleep) {
+        const pts = a.sleep.map((d) => ({ t: d.t, v: this._sleepHours(d.v) }));
+        chart = pts.some((p) => p.v != null) ? this._barChart(pts, COLORS.sleep, "", { format: (v) => this._hm(v), goal: Number(c.sleep_goal_hours) || 8 })
+          : `<div class="empty small">No sleep recorded in the last ${a.days.length} days.</div>`;
+      } else if (sel === "heart" && a.heart) {
+        let pts = a.heart.filter((p) => p.t > Date.now() - 864e5);
+        if (pts.length < 2) pts = a.heart;
+        chart = pts.length >= 2 ? this._lineChart(pts, COLORS.heart, "bpm", { decimals: 0, minPad: 5, maxDots: 48 })
+          : `<div class="empty small">Not enough heart-rate readings yet.</div>`;
+      }
+    }
+    const title = { steps: "Daily steps", heart: "Heart rate \u00b7 last 24 h", calories: am.calories ? "Calories burned per day" : "Active calories per day", sleep: "Sleep per night" }[sel] || "";
+    return `<div class="act">${ring}<div class="atiles">${tiles.join("")}</div></div>
+      ${chart ? `<div class="ctitle">${title}</div>${chart}` : ""}`;
+  }
+
+  _actTile(key, label, value, unit, sub) {
+    return `<button class="tile atile ${this._series.activity === key ? "sel" : ""}" data-series="${key}" style="--c:${COLORS[key]}">
+      <span class="tl">${label}</span>
+      <span class="tv">${value}${unit ? `<small>${unit}</small>` : ""}</span>
+      <span class="ts"><span class="sub">${esc(sub)}</span></span>
+    </button>`;
   }
 
   _nav() {
@@ -393,10 +614,11 @@ class BodyStatsCard extends HTMLElement {
   _bind() {
     const root = this.shadowRoot;
     root.querySelectorAll(".tab").forEach((b) => b.addEventListener("click", () => { this._tab = b.dataset.tab; this._render(); }));
-    root.querySelectorAll(".tile").forEach((b) => b.addEventListener("click", () => {
+    root.querySelectorAll(".tile, .ring").forEach((b) => b.addEventListener("click", () => {
       const mode = this._tab;
       if (this._series[mode] === b.dataset.series) {
-        const id = this._metrics[b.dataset.series];
+        const k = b.dataset.series, am = this._actMetrics;
+        const id = mode === "activity" ? (k === "calories" ? am.calories || am.active_calories : am[k]) : this._metrics[k];
         this.dispatchEvent(new CustomEvent("hass-more-info", { bubbles: true, composed: true, detail: { entityId: id } }));
       } else { this._series[mode] = b.dataset.series; this._render(); }
     }));
@@ -419,7 +641,7 @@ class BodyStatsCard extends HTMLElement {
         hov.querySelector("line").setAttribute("x1", best.x); hov.querySelector("line").setAttribute("x2", best.x);
         hov.querySelector("circle").setAttribute("cx", best.x); hov.querySelector("circle").setAttribute("cy", best.y);
         tip.style.display = "";
-        tip.innerHTML = `<b>${fmt(best.v)} ${best.unit}</b><br>${new Date(best.t).toLocaleString(this._lang, { day: "numeric", month: "short", hour: best.daily ? undefined : "2-digit", minute: best.daily ? undefined : "2-digit" })}`;
+        tip.innerHTML = `<b>${best.text ?? fmt(best.v)} ${best.unit}</b><br>${best.dateOnly ? new Date(best.t).toLocaleDateString(this._lang, { weekday: "short", day: "numeric", month: "short" }) : new Date(best.t).toLocaleString(this._lang, { day: "numeric", month: "short", hour: best.daily ? undefined : "2-digit", minute: best.daily ? undefined : "2-digit" })}`;
         const left = (best.x / this._gw) * r.width;
         tip.style.left = `${Math.min(Math.max(left, 50), r.width - 50)}px`;
       };
@@ -490,6 +712,26 @@ class BodyStatsCard extends HTMLElement {
       .tp { fill: var(--secondary-text-color); opacity: .6; }
       .dot { fill: var(--primary-color, #03a9f4); stroke: var(--card-background-color, #fff); stroke-width: 2.5; }
       code { font-size: .9em; }
+      .act { display:flex; gap: 10px; align-items: stretch; flex-wrap: wrap; }
+      .ring { position:relative; flex: 0 0 150px; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:2px; font:inherit; cursor:pointer;
+        border: 1px solid var(--divider-color, rgba(127,127,127,.25)); border-radius: 12px; background:none; color: var(--primary-text-color); padding: 8px; }
+      .ring.sel { border-color: var(--c); background: color-mix(in srgb, var(--c) 10%, transparent); }
+      .ring svg { width: 116px; height: 116px; display:block; }
+      .rbg { fill:none; stroke: color-mix(in srgb, var(--c) 18%, transparent); stroke-width: 10; }
+      .rfg { fill:none; stroke: var(--c); stroke-width: 10; stroke-linecap: round; transition: stroke-dasharray .6s; }
+      .rwrap { position:relative; width:116px; height:116px; }
+      .rc { position:absolute; inset: 0; display:flex; flex-direction:column; align-items:center; justify-content:center; }
+      .rv { font-size: 1.35em; font-weight: 700; line-height: 1.1; }
+      .rl { font-size: .68em; color: var(--secondary-text-color); }
+      .rok { font-size: .7em; color: #16a34a; font-weight: 600; }
+      .ravg { font-size: .72em; color: var(--secondary-text-color); }
+      .atiles { flex: 1 1 180px; display:grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 6px; }
+      .atile .ts { flex-wrap: nowrap; overflow:hidden; } .atile .sub { white-space:nowrap; overflow:hidden; text-overflow: ellipsis; }
+      .ctitle { margin: 12px 2px -4px; font-size: .8em; color: var(--secondary-text-color); }
+      .bar { fill: color-mix(in srgb, var(--c) 55%, transparent); }
+      .bar.hit, .bar.today { fill: var(--c); }
+      .goal { stroke: var(--c); stroke-dasharray: 5 4; stroke-width: 1.2; }
+      .goal-l { fill: var(--c); font-size: 10px; }
     `;
   }
 }
